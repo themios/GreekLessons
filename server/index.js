@@ -10,7 +10,13 @@ const app = express();
 const PORT = 3001;
 
 // Middleware
-app.use(cors());
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production'
+    ? process.env.CORS_ORIGIN
+    : '*', // Allow all origins in development
+  optionsSuccessStatus: 200 // Some legacy browsers (IE11, various SmartTVs) choke on 204
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 
 // Initialize Google Gemini AI
@@ -24,14 +30,6 @@ if (!process.env.GOOGLE_API_KEY) {
   console.error('🔗 Get your API key at: https://makersuite.google.com/app/apikey');
 }
 
-// Helper function to split text into sentences
-const splitIntoSentences = (text) => {
-  return text
-    .split(/[.!?]+/)
-    .map(sentence => sentence.trim())
-    .filter(sentence => sentence.length > 0);
-};
-
 // Generate story endpoint
 app.post('/api/generate-story', async (req, res) => {
   // Check if API key is configured
@@ -44,61 +42,87 @@ app.post('/api/generate-story', async (req, res) => {
 
   try {
     const { topic, length, gradeLevel } = req.body;
+
+    // Input validation
+    if (!topic || typeof topic !== 'string' || topic.trim().length === 0) {
+      return res.status(400).json({ success: false, error: 'Topic is required and must be a string.' });
+    }
+    if (topic.length > 200) {
+      return res.status(400).json({ success: false, error: 'Topic is too long. Maximum 200 characters.' });
+    }
+    const validLengths = ['short', 'medium', 'long'];
+    if (!length || !validLengths.includes(length)) {
+      return res.status(400).json({ success: false, error: 'Invalid length specified.' });
+    }
+    const validGradeLevels = ['preschool', 'kindergarten', '1st', '2nd', '3rd', '4th', '5th'];
+     if (!gradeLevel || !validGradeLevels.includes(gradeLevel)) {
+      return res.status(400).json({ success: false, error: 'Invalid grade level specified.' });
+    }
     
+    // Sanitize topic
+    const sanitizedTopic = topic.trim();
+
     // Determine sentence count based on length
     const sentenceCounts = {
       short: '5-7',
       medium: '8-12',
       long: '13-18'
     };
-    
     const sentenceCount = sentenceCounts[length] || '8-12';
     
     // Get the generative model
-    const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash-exp" });
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash",
+      generationConfig: { responseMimeType: "application/json" }
+    });
     
-    // Generate English story
-    const storyPrompt = `Write a children's story for a ${gradeLevel} grade reading level. 
-    Topic: "${topic}". 
-    Length: approximately ${sentenceCount} sentences. 
-    Use simple vocabulary, friendly tone, and age-appropriate content. 
-    Make it engaging and educational. 
-    End each sentence with proper punctuation (. ! or ?).
-    
-    Please write only the story, no additional text or explanations.`;
+    // Construct the prompt for generating a bilingual story in JSON format
+    const prompt = `
+      You are a bilingual children's story writer. Your task is to generate a story in English
+      and then provide a sentence-by-sentence translation in modern Greek.
 
-    const storyResult = await model.generateContent(storyPrompt);
-    const englishStory = storyResult.response.text().trim();
-    
-    // Translate to Greek
-    const translationPrompt = `Translate the following English children's story to modern Greek. 
-    Maintain the same sentence structure and meaning for each sentence. 
-    Use simple, clear Greek that would be appropriate for language learners.
-    Translate sentence by sentence to maintain alignment.
-    
-    Please provide only the Greek translation, no additional text or explanations.
+      **Instructions:**
+      1.  **Topic:** "${sanitizedTopic}"
+      2.  **Reading Level:** ${gradeLevel} grade
+      3.  **Length:** Approximately ${sentenceCount} sentences
+      4.  **Tone:** Simple vocabulary, friendly, engaging, and educational.
+      5.  **Output Format:** Respond with a single, valid JSON object. Do not include any text
+          or explanations outside of the JSON object. The JSON object must have a single key, "story",
+          which is an array of objects. Each object in the array represents a sentence and must have
+          two keys: "english" and "greek".
 
-    Story to translate:
-    ${englishStory}`;
+      **Example Response:**
+      {
+        "story": [
+          {
+            "english": "Once upon a time, there was a little bear.",
+            "greek": "Μια φορά κι έναν καιρό, ήταν ένα μικρό αρκουδάκι."
+          },
+          {
+            "english": "He loved to eat honey.",
+            "greek": "Του άρεσε πολύ να τρώει μέλι."
+          }
+        ]
+      }
+    `;
 
-    const translationResult = await model.generateContent(translationPrompt);
-    const greekStory = translationResult.response.text().trim();
-    
-    // Split into sentences and create pairs
-    const englishSentences = splitIntoSentences(englishStory);
-    const greekSentences = splitIntoSentences(greekStory);
-    
-    // Ensure we have matching sentence counts
-    const minLength = Math.min(englishSentences.length, greekSentences.length);
-    
-    const pairs = [];
-    for (let i = 0; i < minLength; i++) {
-      pairs.push({
-        id: i + 1,
-        english: englishSentences[i],
-        greek: greekSentences[i]
-      });
+    const result = await model.generateContent(prompt);
+    const responseText = result.response.text();
+    const storyData = JSON.parse(responseText);
+
+    if (!storyData.story || !Array.isArray(storyData.story)) {
+      throw new Error('Invalid story format received from AI.');
     }
+
+    // Process the structured data
+    const pairs = storyData.story.map((pair, index) => ({
+      id: index + 1,
+      english: pair.english.trim(),
+      greek: pair.greek.trim()
+    }));
+
+    const englishStory = pairs.map(p => p.english).join(' ');
+    const greekStory = pairs.map(p => p.greek).join(' ');
 
     const generatedStory = {
       englishStory,
@@ -117,6 +141,13 @@ app.post('/api/generate-story', async (req, res) => {
   } catch (error) {
     console.error('Error generating story:', error);
     
+    if (error instanceof SyntaxError) {
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to parse the story from the AI. The format was invalid.'
+      });
+    }
+
     // Handle specific Google API authentication errors
     if (error.status === 401 || error.message?.includes('API key')) {
       return res.status(500).json({
